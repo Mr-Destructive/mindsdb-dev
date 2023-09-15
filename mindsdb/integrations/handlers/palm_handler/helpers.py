@@ -13,7 +13,7 @@ def retry_with_exponential_backoff(
         hour_budget: float = 0.3,
         jitter: bool = False,
         exponential_base: int = 2,
-        errors: tuple = (palm.error.RateLimitError, palm.error.APIConnectionError),
+        errors: tuple = (),
 ):
     """
     Wrapper to enable optional arguments. It means this decorator always needs to be called with parenthesis:
@@ -69,12 +69,6 @@ def retry_with_exponential_backoff(
                     # Increment the delay and wait
                     delay *= exponential_base * (1 + jitter * random.random())
                     time.sleep(delay)
-
-                except palm.error.palmError as e:
-                    if e.error is not None and e.error['type'] == 'insufficient_quota':
-                        raise Exception(
-                            'API key has exceeded its quota, please try 1) increasing it or 2) using another key.')  # noqa
-                    raise e
 
                 except Exception as e:
                     raise e

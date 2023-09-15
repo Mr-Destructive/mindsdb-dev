@@ -99,8 +99,11 @@ class PalmHandler(BaseMLEngine):
         args = args['using']
 
         args['target'] = target
+        print("FFF", args)
         api_key = get_api_key('palm', args, self.engine_storage)
-        available_models = [m.palm_id for m in palm.Model.list(api_key=api_key).data]
+        palm.configure(api_key=args['api_key'])
+        available_models = [m.name for m in palm.list_models()]
+
         if not args.get('model_name'):
             args['model_name'] = self.default_model
         elif args['model_name'] not in available_models:
@@ -141,7 +144,7 @@ class PalmHandler(BaseMLEngine):
         if args.get('mode', self.default_mode) == 'embedding':
             api_args = {
                 'question_column': pred_args.get('question_column', None),
-                'model': pred_args.get('model_name', 'text-embedding-ada-002')
+                'model': pred_args.get('model_name', 'embedding-gecko-001')
             }
             model_name = 'embedding'
             if args.get('question_column'):
@@ -273,15 +276,16 @@ class PalmHandler(BaseMLEngine):
         def _submit_completion(model_name, prompts, api_key, api_args, args, df):
             kwargs = {
                 'model': model_name,
-                'api_key': api_key,
-                'organization': args.get('api_organization'),
+                'prompt': prompts,
             }
-            
+            palm.configure(api_key=api_key)
+
             if model_name == 'embedding':
                 return _submit_embedding_completion(kwargs, prompts, api_args)
             elif model_name in self.chat_completion_models:
                 return _submit_chat_completion(kwargs, prompts, api_args, df, mode=args.get('mode', 'conversational'))
             else:
+                print("Before complete call")
                 return _submit_normal_completion(kwargs, prompts, api_args)
 
         def _log_api_call(params, response):
@@ -304,6 +308,7 @@ class PalmHandler(BaseMLEngine):
             kwargs = {**kwargs, **api_args}
 
             before_palm_query(kwargs)
+            print("In submit")
             resp = _tidy(palm.generate_text(**kwargs))
             _log_api_call(kwargs, resp)
             return resp
@@ -327,9 +332,9 @@ class PalmHandler(BaseMLEngine):
         def _submit_chat_completion(kwargs, prompts, api_args, df, mode='conversational'):
             def _tidy(comp):
                 tidy_comps = []
-                for c in comp['choices']:
-                    if 'message' in c:
-                        tidy_comps.append(c['message']['content'].strip('\n').strip(''))
+                for c in comp.candidates:
+                    if 'output' in c:
+                        tidy_comps.append(c['output'].strip('\n').strip(''))
                 return tidy_comps
 
             completions = []
@@ -339,19 +344,14 @@ class PalmHandler(BaseMLEngine):
                 # get prompt from model
                 initial_prompt = {"role": "system",  "content": args['prompt']}  # noqa
 
-            kwargs['messages'] = [initial_prompt]
+            #kwargs['messages'] = [initial_prompt]
             last_completion_content = None
 
             for pidx in range(len(prompts)):
-                if mode != 'conversational':
+                if mode == 'conversational':
                     kwargs['messages'].append({'role': 'user', 'content': prompts[pidx]})
                 else:
                     question = prompts[pidx]
-                    if question:
-                        kwargs['messages'].append({'role': 'user', 'content': question})
-                    answer = df.iloc[pidx][args.get('assistant_column')]
-                    if answer:
-                        kwargs['messages'].append({'role': 'assistant', 'content': answer})
 
                 if mode == 'conversational-full' or (mode == 'conversational' and pidx == len(prompts) - 1):
                     kwargs['messages'] = truncate_msgs_for_token_limit(kwargs['messages'],
@@ -365,11 +365,13 @@ class PalmHandler(BaseMLEngine):
 
                     completions.extend(resp)
                 elif mode == 'default':
-                    kwargs['messages'] = [initial_prompt] + [kwargs['messages'][-1]]
+                    #kwargs['messages'] = [initial_prompt] + [kwargs['messages'][-1]]
                     pkwargs = {**kwargs, **api_args}
+                    pkwargs['prompt'] = "".join(kwargs['prompt'])
+                    pkwargs['model'] = "models/text-bison-001"
 
                     before_palm_query(kwargs)
-                    resp = _tidy(palm.ChatCompletion.create(**pkwargs))
+                    resp = _tidy(palm.generate_text(**pkwargs))
                     _log_api_call(pkwargs, resp)
 
                     completions.extend(resp)
@@ -401,10 +403,10 @@ class PalmHandler(BaseMLEngine):
                 args,
                 df
             )
+            print(completion)
             return completion
-        except palm.error.InvalidRequestError as e:
+        except Exception as e:
             # else, we get the max batch size
-            e = e.user_message
             if 'you can currently request up to at most a total of' in e:
                 pattern = 'a total of'
                 max_batch_size = int(e[e.find(pattern) + len(pattern):].split(').')[0])
@@ -448,146 +450,7 @@ class PalmHandler(BaseMLEngine):
 
         return completion
 
-    def describe(self, attribute: Optional[str] = None) -> pd.DataFrame:
-        # TODO: Update to use update() artifacts
-
-        args = self.model_storage.json_get('args')
-
-        if attribute == 'args':
-            return pd.DataFrame(args.items(), columns=['key', 'value'])
-        elif attribute == 'metadata':
-            api_key = get_api_key('palm', args, self.engine_storage)
-            model_name = args.get('model_name', self.default_model)
-            meta = palm.Model.retrieve(model_name, api_key=api_key)
-            return pd.DataFrame(meta.items(), columns=['key', 'value'])
-        else:
-            tables = ['args', 'metadata']
-            return pd.DataFrame(tables, columns=['tables'])
-
-    def finetune(self, df: Optional[pd.DataFrame] = None, args: Optional[Dict] = None) -> None:
-        """
-        Fine-tune palm GPT models. Steps are roughly:
-          - Analyze input data and modify it according to suggestions made by the palm utility tool
-          - Get a training and validation file
-          - Determine base model to use
-          - Submit a fine-tuning job via the palm API
-          - Monitor progress with exponential backoff (which has been modified for greater control given a time budget in hours), 
-          - Gather stats once fine-tuning finishes
-          - Modify model metadata so that the new version triggers the fine-tuned version of the model (stored in the user's palm account)
-
-        Caveats: 
-          - As base fine-tuning models, palm only supports the original GPT ones: `ada`, `babbage`, `curie`, `davinci`. This means if you fine-tune successively more than once, any fine-tuning other than the most recent one is lost.
-        """  # noqa
-
-        args = args if args else {}
-        using_args = args.pop('using') if 'using' in args else {}
-        prompt_col = using_args.get('prompt_column', 'prompt')
-        completion_col = using_args.get('completion_column', 'completion')
-
-        for col in [prompt_col, completion_col]:
-            if col not in set(df.columns):
-                raise Exception(f"To fine-tune this palm model, please format your select data query to have a `{prompt_col}` column and a `{completion_col}` column first.")  # noqa
-
-        args = {**using_args, **args}
-        prev_model_name = self.base_model_storage.json_get('args').get('model_name', '')
-
-        palm.api_key = get_api_key('palm', args, self.engine_storage)
-        finetune_time = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-
-        temp_storage_path = tempfile.mkdtemp()
-        temp_file_name = f"ft_{finetune_time}"
-        temp_model_storage_path = f"{temp_storage_path}/{temp_file_name}.jsonl"
-        df.to_json(temp_model_storage_path, orient='records', lines=True)
-
-        # TODO avoid subprocess usage once palm enables non-CLI access
-        subprocess.run(
-            [
-                "palm", "tools", "fine_tunes.prepare_data",
-                "-f", temp_model_storage_path,                  # from file
-                '-q'                                            # quiet mode (accepts all suggestions)
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            encoding="utf-8",
-        )
-
-        file_names = {'original': f'{temp_file_name}.jsonl',
-                      'base': f'{temp_file_name}_prepared.jsonl',
-                      'train': f'{temp_file_name}_prepared_train.jsonl',
-                      'val': f'{temp_file_name}_prepared_valid.jsonl'}
-        jsons = {k: None for k in file_names.keys()}
-        for split, file_name in file_names.items():
-            if os.path.isfile(os.path.join(temp_storage_path, file_name)):
-                jsons[split] = palm.File.create(
-                    file=open(f"{temp_storage_path}/{file_name}", "rb"),
-                    purpose='fine-tune')
-
-        train_file_id = jsons['train'].id if isinstance(jsons['train'], palm.File) else jsons['base'].id
-        val_file_id = jsons['val'].id if isinstance(jsons['val'], palm.File) else None
-
-        def _get_model_type(model_name: str):
-            for model_type in ['ada', 'curie', 'babbage', 'davinci']:
-                if model_type in model_name.lower():
-                    return model_type
-            return 'ada'
-
-        # `None` values are internally imputed by palm to `null` or default values
-        ft_params = {
-            'training_file': train_file_id,
-            'validation_file': val_file_id,
-            'model': _get_model_type(prev_model_name),
-            'suffix': 'mindsdb',
-            'n_epochs': using_args.get('n_epochs', None),
-            'batch_size': using_args.get('batch_size', None),
-            'learning_rate_multiplier': using_args.get('learning_rate_multiplier', None),
-            'prompt_loss_weight': using_args.get('prompt_loss_weight', None),
-            'compute_classification_metrics': using_args.get('compute_classification_metrics', None),
-            'classification_n_classes': using_args.get('classification_n_classes', None),
-            'classification_positive_class': using_args.get('classification_positive_class', None),
-            'classification_betas': using_args.get('classification_betas', None),
-        }
-
-        start_time = datetime.datetime.now()
-        ft_result = palm.FineTune.create(**{k: v for k, v in ft_params.items() if v is not None})
-
-        @retry_with_exponential_backoff(
-            hour_budget=args.get('hour_budget', 8),
-            errors=(palm.error.RateLimitError, palm.error.palmError))
-        def _check_ft_status(model_id):
-            ft_retrieved = palm.FineTune.retrieve(id=model_id)
-            if ft_retrieved['status'] in ('succeeded', 'failed'):
-                return ft_retrieved
-            else:
-                raise palm.error.palmError('Fine-tuning still pending!')
-
-        ft_stats = _check_ft_status(ft_result.id)
-        ft_model_name = ft_stats['fine_tuned_model']
-
-        if ft_stats['status'] != 'succeeded':
-            raise Exception(f"Fine-tuning did not complete successfully (status: {ft_stats['status']}). Error message: {ft_stats['events'][-1]['message']}")  # noqa
-
-        end_time = datetime.datetime.now()
-        runtime = end_time - start_time
-
-        result_file_id = palm.FineTune.retrieve(id=ft_result.id)['result_files'][0].id
-        name_extension = palm.File.retrieve(id=result_file_id).filename
-        result_path = f'{temp_storage_path}/ft_{finetune_time}_result_{name_extension}'
-        with open(result_path, 'wb') as f:
-            f.write(palm.File.download(id=result_file_id))
-
-        train_stats = pd.read_csv(result_path)
-        if 'validation_token_accuracy' in train_stats.columns:
-            train_stats = train_stats[train_stats['validation_token_accuracy'].notnull()]
-
-        args['model_name'] = ft_model_name
-        args['ft_api_info'] = ft_stats.to_dict_recursive()
-        args['ft_result_stats'] = train_stats.to_dict()
-        args['runtime'] = runtime.total_seconds()
-        args['mode'] = self.base_model_storage.json_get('args').get('mode', self.default_mode)
-
-        self.model_storage.json_set('args', args)
-        shutil.rmtree(temp_storage_path)
-
+    
     @staticmethod
     def _get_completed_prompts(base_template, df):
         columns = []
